@@ -1,0 +1,397 @@
+#!/usr/bin/env python3
+"""Own the session-bus idle-inhibit names and drive Omarchy stay-awake.
+
+Omarchy's idle service honors Wayland `zwp_idle_inhibit_manager_v1` only.
+Browsers and players (Chromium, Firefox/Zen, VLC) request inhibit over
+D-Bus `org.freedesktop.ScreenSaver` / `org.freedesktop.PowerManagement.Inhibit`.
+Nothing has owned those names since hypridle was replaced, so the calls are
+dropped and the screensaver fires over playing video.
+
+This daemon:
+- owns both well-known names (stands down with exit 0 if ScreenSaver is taken)
+- answers Inhibit/UnInhibit on the object paths Chromium, Firefox, and VLC use
+- reaps inhibits when the caller leaves the bus
+- toggles Omarchy's stay-awake indicator for the duration, without clearing a
+  stay-awake the user turned on themselves
+
+State directory (override with OMARCHY_IDLE_INHIBIT_STATE_DIR):
+  ~/.local/state/omarchy/indicators/stay-awake       # same file as `omarchy toggle idle`
+  ~/.local/state/omarchy/indicators/idle-inhibit     # we created stay-awake
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import signal
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+import gi
+
+gi.require_version("Gio", "2.0")
+gi.require_version("GLib", "2.0")
+from gi.repository import Gio, GLib
+
+SCREENSAVER_NAME = "org.freedesktop.ScreenSaver"
+PM_INHIBIT_NAME = "org.freedesktop.PowerManagement.Inhibit"
+
+SCREENSAVER_XML = """
+<node>
+  <interface name="org.freedesktop.ScreenSaver">
+    <method name="Inhibit">
+      <arg direction="in" type="s" name="application_name"/>
+      <arg direction="in" type="s" name="reason_for_inhibit"/>
+      <arg direction="out" type="u" name="cookie"/>
+    </method>
+    <method name="UnInhibit">
+      <arg direction="in" type="u" name="cookie"/>
+    </method>
+  </interface>
+</node>
+"""
+
+PM_XML = """
+<node>
+  <interface name="org.freedesktop.PowerManagement.Inhibit">
+    <method name="Inhibit">
+      <arg direction="in" type="s" name="application_name"/>
+      <arg direction="in" type="s" name="reason_for_inhibit"/>
+      <arg direction="out" type="u" name="cookie"/>
+    </method>
+    <method name="UnInhibit">
+      <arg direction="in" type="u" name="cookie"/>
+    </method>
+    <method name="HasInhibit">
+      <arg direction="out" type="b" name="has_inhibit"/>
+    </method>
+    <signal name="HasInhibitChanged">
+      <arg type="b" name="has_inhibit"/>
+    </signal>
+  </interface>
+</node>
+"""
+
+MAX_INHIBITS = 1024
+MAX_STRING = 256
+COOKIE_MASK = 0xFFFFFFFF
+
+
+def state_dir() -> Path:
+    override = os.environ.get("OMARCHY_IDLE_INHIBIT_STATE_DIR")
+    if override:
+        return Path(override)
+    return Path.home() / ".local/state/omarchy/indicators"
+
+
+def clip(value: str) -> str:
+    text = str(value or "")
+    if len(text) <= MAX_STRING:
+        return text
+    return text[: MAX_STRING - 1] + "…"
+
+
+@dataclass
+class Hold:
+    sender: str
+    app: str
+    reason: str
+
+
+class IdleInhibitDaemon:
+    def __init__(self) -> None:
+        self.loop = GLib.MainLoop()
+        self.connection: Gio.DBusConnection | None = None
+        self.holds: dict[int, Hold] = {}
+        self.next_cookie = 1
+        self.pm_paths = (
+            "/org/freedesktop/PowerManagement/Inhibit",
+            "/org/freedesktop/PowerManagement",
+        )
+        self.screensaver_acquired = False
+        self.pm_acquired = False
+        self.objects_registered = False
+        self.exit_code = 0
+        self.auto_active = False
+        self.stopping = False
+
+    @property
+    def held(self) -> bool:
+        return bool(self.holds)
+
+    def stay_awake_path(self) -> Path:
+        return state_dir() / "stay-awake"
+
+    def auto_path(self) -> Path:
+        return state_dir() / "idle-inhibit"
+
+    def status(self) -> dict:
+        holders = [
+            {
+                "cookie": cookie,
+                "sender": hold.sender,
+                "app": hold.app,
+                "reason": hold.reason,
+            }
+            for cookie, hold in sorted(self.holds.items())
+        ]
+        return {
+            "held": self.held,
+            "count": len(self.holds),
+            "holders": holders,
+            "stayAwake": self.stay_awake_path().exists(),
+            "auto": self.auto_path().exists(),
+            "screensaverName": self.screensaver_acquired,
+            "powerManagementName": self.pm_acquired,
+        }
+
+    def publish(self) -> None:
+        sys.stdout.write(json.dumps(self.status(), separators=(",", ":")) + "\n")
+        sys.stdout.flush()
+
+    def log(self, message: str) -> None:
+        sys.stderr.write(f"idle-inhibit: {message}\n")
+        sys.stderr.flush()
+
+    def allocate_cookie(self) -> int | None:
+        if len(self.holds) >= MAX_INHIBITS:
+            return None
+        for _ in range(COOKIE_MASK):
+            cookie = self.next_cookie
+            self.next_cookie = cookie + 1
+            if self.next_cookie > COOKIE_MASK:
+                self.next_cookie = 1
+            if cookie != 0 and cookie not in self.holds:
+                return cookie
+        return None
+
+    def inhibit(self, sender: str, app: str, reason: str) -> int | None:
+        cookie = self.allocate_cookie()
+        if cookie is None:
+            return None
+        was_held = self.held
+        self.holds[cookie] = Hold(sender=sender, app=clip(app), reason=clip(reason))
+        self.sync_stay_awake()
+        if not was_held:
+            self.emit_has_inhibit_changed()
+        self.publish()
+        self.log(f"inhibit cookie={cookie} app={clip(app)!r} reason={clip(reason)!r} sender={sender}")
+        return cookie
+
+    def uninhibit(self, cookie: int) -> None:
+        if cookie not in self.holds:
+            return
+        hold = self.holds.pop(cookie)
+        self.sync_stay_awake()
+        if not self.held:
+            self.emit_has_inhibit_changed()
+        self.publish()
+        self.log(f"uninhibit cookie={cookie} app={hold.app!r} sender={hold.sender}")
+
+    def drop_sender(self, sender: str) -> None:
+        cookies = [cookie for cookie, hold in self.holds.items() if hold.sender == sender]
+        if not cookies:
+            return
+        was_held = self.held
+        for cookie in cookies:
+            self.holds.pop(cookie, None)
+        self.sync_stay_awake()
+        if was_held and not self.held:
+            self.emit_has_inhibit_changed()
+        self.publish()
+        self.log(f"reaped {len(cookies)} inhibit(s) from {sender}")
+
+    def sync_stay_awake(self) -> None:
+        directory = state_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        stay = self.stay_awake_path()
+        auto = self.auto_path()
+
+        if self.held:
+            if stay.exists() and not auto.exists():
+                return
+            auto.touch()
+            stay.touch()
+            self.auto_active = True
+            return
+
+        if auto.exists() or self.auto_active:
+            auto.unlink(missing_ok=True)
+            stay.unlink(missing_ok=True)
+            self.auto_active = False
+
+    def emit_has_inhibit_changed(self) -> None:
+        if self.connection is None:
+            return
+        payload = GLib.Variant("(b)", (self.held,))
+        for path in self.pm_paths:
+            try:
+                self.connection.emit_signal(
+                    None,
+                    path,
+                    PM_INHIBIT_NAME,
+                    "HasInhibitChanged",
+                    payload,
+                )
+            except GLib.Error as error:
+                self.log(f"HasInhibitChanged failed on {path}: {error}")
+
+    def on_screensaver_method(self, connection, sender, object_path, interface_name, method_name, parameters, invocation):
+        self.dispatch_method(sender, method_name, parameters, invocation, has_inhibit=False)
+
+    def on_pm_method(self, connection, sender, object_path, interface_name, method_name, parameters, invocation):
+        self.dispatch_method(sender, method_name, parameters, invocation, has_inhibit=True)
+
+    def dispatch_method(self, sender, method_name, parameters, invocation, has_inhibit: bool) -> None:
+        try:
+            if method_name == "Inhibit":
+                app, reason = parameters.unpack()
+                cookie = self.inhibit(sender, app, reason)
+                if cookie is None:
+                    invocation.return_dbus_error(
+                        "org.freedesktop.DBus.Error.LimitsExceeded",
+                        "too many idle inhibits",
+                    )
+                    return
+                invocation.return_value(GLib.Variant("(u)", (cookie,)))
+                return
+            if method_name == "UnInhibit":
+                (cookie,) = parameters.unpack()
+                self.uninhibit(int(cookie))
+                invocation.return_value(None)
+                return
+            if has_inhibit and method_name == "HasInhibit":
+                invocation.return_value(GLib.Variant("(b)", (self.held,)))
+                return
+            invocation.return_dbus_error(
+                "org.freedesktop.DBus.Error.UnknownMethod",
+                method_name,
+            )
+        except Exception as error:  # noqa: BLE001 - must not hang the D-Bus caller
+            self.log(f"method {method_name} failed: {error}")
+            invocation.return_dbus_error("org.freedesktop.DBus.Error.Failed", str(error))
+
+    def on_name_owner_changed(self, connection, sender_name, object_path, interface_name, signal_name, parameters):
+        name, _old_owner, new_owner = parameters.unpack()
+        if new_owner == "" and str(name).startswith(":"):
+            self.drop_sender(name)
+
+    def register_objects(self, connection: Gio.DBusConnection) -> None:
+        if self.objects_registered:
+            return
+        self.connection = connection
+        screensaver_info = Gio.DBusNodeInfo.new_for_xml(SCREENSAVER_XML).interfaces[0]
+        pm_info = Gio.DBusNodeInfo.new_for_xml(PM_XML).interfaces[0]
+
+        for path in ("/org/freedesktop/ScreenSaver", "/ScreenSaver"):
+            connection.register_object(path, screensaver_info, self.on_screensaver_method, None, None)
+        for path in self.pm_paths:
+            connection.register_object(path, pm_info, self.on_pm_method, None, None)
+
+        connection.signal_subscribe(
+            "org.freedesktop.DBus",
+            "org.freedesktop.DBus",
+            "NameOwnerChanged",
+            "/org/freedesktop/DBus",
+            None,
+            Gio.DBusSignalFlags.NONE,
+            self.on_name_owner_changed,
+        )
+        self.objects_registered = True
+        self.publish()
+
+    def on_bus_acquired(self, connection, name) -> None:
+        self.register_objects(connection)
+
+    def on_screensaver_acquired(self, connection, name) -> None:
+        self.screensaver_acquired = True
+        self.register_objects(connection)
+        self.log("acquired org.freedesktop.ScreenSaver")
+
+    def on_screensaver_lost(self, connection, name) -> None:
+        if self.stopping:
+            return
+        if self.screensaver_acquired:
+            self.log("lost org.freedesktop.ScreenSaver; standing down")
+        else:
+            self.log("org.freedesktop.ScreenSaver already owned; standing down")
+        self.exit_code = 0
+        self.request_stop()
+
+    def on_pm_acquired(self, connection, name) -> None:
+        self.pm_acquired = True
+        self.register_objects(connection)
+        self.log("acquired org.freedesktop.PowerManagement.Inhibit")
+
+    def on_pm_lost(self, connection, name) -> None:
+        self.pm_acquired = False
+        self.log("org.freedesktop.PowerManagement.Inhibit not acquired")
+
+    def shutdown(self) -> None:
+        self.holds.clear()
+        self.sync_stay_awake()
+        self.publish()
+
+    def request_stop(self) -> None:
+        if self.stopping:
+            return
+        self.stopping = True
+        self.shutdown()
+        if self.loop.is_running():
+            self.loop.quit()
+        else:
+            GLib.idle_add(self.loop.quit)
+
+    def on_stop(self, *_args) -> bool:
+        self.log("stopping")
+        self.request_stop()
+        return GLib.SOURCE_REMOVE
+
+    def install_signal_handlers(self) -> None:
+        try:
+            gi.require_version("GLibUnix", "2.0")
+            from gi.repository import GLibUnix
+
+            GLibUnix.signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, self.on_stop)
+            GLibUnix.signal_add(GLib.PRIORITY_DEFAULT, signal.SIGINT, self.on_stop)
+            return
+        except (ValueError, ImportError, AttributeError):
+            pass
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, self.on_stop)
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGINT, self.on_stop)
+
+    def run(self) -> int:
+        leftover = self.auto_path()
+        if leftover.exists():
+            leftover.unlink()
+            self.stay_awake_path().unlink(missing_ok=True)
+            self.log("cleared leftover auto stay-awake")
+
+        self.install_signal_handlers()
+        Gio.bus_own_name(
+            Gio.BusType.SESSION,
+            SCREENSAVER_NAME,
+            Gio.BusNameOwnerFlags.DO_NOT_QUEUE,
+            self.on_bus_acquired,
+            self.on_screensaver_acquired,
+            self.on_screensaver_lost,
+        )
+        Gio.bus_own_name(
+            Gio.BusType.SESSION,
+            PM_INHIBIT_NAME,
+            Gio.BusNameOwnerFlags.DO_NOT_QUEUE,
+            None,
+            self.on_pm_acquired,
+            self.on_pm_lost,
+        )
+        self.loop.run()
+        return self.exit_code
+
+
+def main() -> int:
+    return IdleInhibitDaemon().run()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

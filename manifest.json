@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "id": "lukaseppler.idle-inhibit",
+  "name": "Idle Inhibit",
+  "version": "1.0.0",
+  "author": "Lukas Eppler",
+  "license": "MIT",
+  "homepage": "https://github.com/lukaseppler/omarchy-idle-inhibit",
+  "description": "Keeps the Omarchy screensaver and lock off while a browser or player is playing video, by honoring D-Bus idle inhibits that Omarchy currently drops.",
+  "kinds": ["service"],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Service.qml"
+  }
+}
