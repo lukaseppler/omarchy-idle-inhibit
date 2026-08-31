@@ -6,7 +6,7 @@
   "author": "Lukas Eppler",
   "license": "MIT",
   "homepage": "https://github.com/lukaseppler/omarchy-idle-inhibit",
-  "description": "Keeps the Omarchy screensaver and lock off while a browser or player is playing video, by honoring D-Bus idle inhibits that Omarchy currently drops.",
+  "description": "Keeps the screensaver off while a browser or player is playing video.",
   "kinds": ["service"],
   "keepLoaded": true,
   "entryPoints": {

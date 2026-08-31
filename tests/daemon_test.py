@@ -7,6 +7,7 @@ import os
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import unittest
 from pathlib import Path
@@ -14,86 +15,64 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 DAEMON = ROOT / "bin" / "idle-inhibit-daemon"
 
-gi = None
 Gio = None
 GLib = None
 
 
 def _load_gi():
-    global gi, Gio, GLib
+    global Gio, GLib
     if Gio is not None:
         return
-    import gi as _gi
+    import gi
 
-    _gi.require_version("Gio", "2.0")
-    _gi.require_version("GLib", "2.0")
+    gi.require_version("Gio", "2.0")
+    gi.require_version("GLib", "2.0")
     from gi.repository import Gio as _Gio, GLib as _GLib
 
-    gi = _gi
     Gio = _Gio
     GLib = _GLib
 
 
 class Daemon:
     def __init__(self, state_dir: Path):
-        self.state_dir = state_dir
         self.proc = subprocess.Popen(
             [sys.executable, str(DAEMON)],
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
             env={**os.environ, "OMARCHY_IDLE_INHIBIT_STATE_DIR": str(state_dir)},
-            text=True,
         )
 
-    def wait_for_name(self, name: str, timeout: float = 4.0) -> None:
+    def wait_for_name(self, timeout: float = 4.0) -> None:
         deadline = time.time() + timeout
         conn = Gio.bus_get_sync(Gio.BusType.SESSION, None)
         while time.time() < deadline:
             if self.proc.poll() is not None:
-                raise RuntimeError(f"daemon exited {self.proc.returncode}: {self.proc.stderr.read()}")
-            try:
-                conn.call_sync(
-                    "org.freedesktop.DBus",
-                    "/org/freedesktop/DBus",
-                    "org.freedesktop.DBus",
-                    "NameHasOwner",
-                    GLib.Variant("(s)", (name,)),
-                    GLib.VariantType("(b)"),
-                    Gio.DBusCallFlags.NONE,
-                    200,
-                    None,
-                )
-                owned = conn.call_sync(
-                    "org.freedesktop.DBus",
-                    "/org/freedesktop/DBus",
-                    "org.freedesktop.DBus",
-                    "NameHasOwner",
-                    GLib.Variant("(s)", (name,)),
-                    GLib.VariantType("(b)"),
-                    Gio.DBusCallFlags.NONE,
-                    200,
-                    None,
-                ).unpack()[0]
-                if owned:
-                    return
-            except Exception:
-                pass
+                raise RuntimeError(f"daemon exited {self.proc.returncode}")
+            owned = conn.call_sync(
+                "org.freedesktop.DBus",
+                "/org/freedesktop/DBus",
+                "org.freedesktop.DBus",
+                "NameHasOwner",
+                GLib.Variant("(s)", ("org.freedesktop.ScreenSaver",)),
+                GLib.VariantType("(b)"),
+                Gio.DBusCallFlags.NONE,
+                200,
+                None,
+            ).unpack()[0]
+            if owned:
+                return
             time.sleep(0.05)
-        raise TimeoutError(f"timed out waiting for {name}: {self.proc.stderr.read()}")
+        raise TimeoutError("timed out waiting for org.freedesktop.ScreenSaver")
 
     def stop(self) -> int:
         if self.proc.poll() is None:
             self.proc.send_signal(signal.SIGTERM)
             try:
-                code = self.proc.wait(timeout=3)
+                return self.proc.wait(timeout=3)
             except subprocess.TimeoutExpired:
                 self.proc.kill()
-                code = self.proc.wait(timeout=2)
-        else:
-            code = self.proc.returncode if self.proc.returncode is not None else 1
-        if self.proc.stderr:
-            self.proc.stderr.close()
-        return code
+                return self.proc.wait(timeout=2)
+        return self.proc.returncode if self.proc.returncode is not None else 1
 
 
 def wait_for(predicate, timeout: float = 3.0, message: str = "condition"):
@@ -105,26 +84,8 @@ def wait_for(predicate, timeout: float = 3.0, message: str = "condition"):
     raise TimeoutError(message)
 
 
-def bus_call(dest, path, iface, method, parameters=None, reply_type=None):
-    conn = Gio.bus_get_sync(Gio.BusType.SESSION, None)
-    return conn.call_sync(
-        dest,
-        path,
-        iface,
-        method,
-        parameters,
-        reply_type,
-        Gio.DBusCallFlags.NONE,
-        2000,
-        None,
-    )
-
-
 class HoldingClient:
-    def __init__(self, path="/org/freedesktop/ScreenSaver", dest="org.freedesktop.ScreenSaver", iface="org.freedesktop.ScreenSaver"):
-        # A private connection so close() drops this client's unique name
-        # without tearing down the shared session bus used by the rest of the
-        # test process.
+    def __init__(self, path="/org/freedesktop/ScreenSaver"):
         address = Gio.dbus_address_get_for_bus_sync(Gio.BusType.SESSION, None)
         self.conn = Gio.DBusConnection.new_for_address_sync(
             address,
@@ -134,9 +95,9 @@ class HoldingClient:
             None,
         )
         reply = self.conn.call_sync(
-            dest,
+            "org.freedesktop.ScreenSaver",
             path,
-            iface,
+            "org.freedesktop.ScreenSaver",
             "Inhibit",
             GLib.Variant("(ss)", ("chromium", "playing-video")),
             GLib.VariantType("(u)"),
@@ -146,11 +107,11 @@ class HoldingClient:
         )
         self.cookie = int(reply.unpack()[0])
 
-    def uninhibit(self, path="/org/freedesktop/ScreenSaver", dest="org.freedesktop.ScreenSaver", iface="org.freedesktop.ScreenSaver"):
+    def uninhibit(self, path="/org/freedesktop/ScreenSaver"):
         self.conn.call_sync(
-            dest,
+            "org.freedesktop.ScreenSaver",
             path,
-            iface,
+            "org.freedesktop.ScreenSaver",
             "UnInhibit",
             GLib.Variant("(u)", (self.cookie,)),
             None,
@@ -168,10 +129,12 @@ class IdleInhibitTests(unittest.TestCase):
         _load_gi()
         self.state_dir = Path(os.environ["OMARCHY_IDLE_INHIBIT_STATE_DIR"])
         self.state_dir.mkdir(parents=True, exist_ok=True)
+        self.start_daemon()
+
+    def start_daemon(self):
         self.daemon = Daemon(self.state_dir)
         self.addCleanup(self.daemon.stop)
-        self.daemon.wait_for_name("org.freedesktop.ScreenSaver")
-        self.daemon.wait_for_name("org.freedesktop.PowerManagement.Inhibit")
+        self.daemon.wait_for_name()
 
     def test_chromium_path_toggles_stay_awake(self):
         stay = self.state_dir / "stay-awake"
@@ -179,14 +142,6 @@ class IdleInhibitTests(unittest.TestCase):
         holder = HoldingClient()
         wait_for(stay.exists, message="stay-awake missing after Inhibit")
         wait_for(auto.exists, message="auto marker missing after Inhibit")
-        has = bus_call(
-            "org.freedesktop.PowerManagement.Inhibit",
-            "/org/freedesktop/PowerManagement/Inhibit",
-            "org.freedesktop.PowerManagement.Inhibit",
-            "HasInhibit",
-            reply_type=GLib.VariantType("(b)"),
-        ).unpack()[0]
-        self.assertTrue(has)
         holder.uninhibit(path="/ScreenSaver")
         wait_for(lambda: not stay.exists(), message="stay-awake lingered after UnInhibit")
         wait_for(lambda: not auto.exists(), message="auto marker lingered after UnInhibit")
@@ -201,10 +156,10 @@ class IdleInhibitTests(unittest.TestCase):
 
     def test_second_daemon_stands_down(self):
         second = Daemon(self.state_dir)
+        self.addCleanup(second.stop)
         try:
             code = second.proc.wait(timeout=3)
         except subprocess.TimeoutExpired:
-            second.proc.kill()
             self.fail("second daemon did not stand down")
         self.assertEqual(code, 0)
 
@@ -213,10 +168,8 @@ class IdleInhibitTests(unittest.TestCase):
         stay = self.state_dir / "stay-awake"
         auto = self.state_dir / "idle-inhibit"
         stay.touch()
-        if auto.exists():
-            auto.unlink()
-        self.daemon = Daemon(self.state_dir)
-        self.daemon.wait_for_name("org.freedesktop.ScreenSaver")
+        auto.unlink(missing_ok=True)
+        self.start_daemon()
         holder = HoldingClient()
         time.sleep(0.2)
         self.assertTrue(stay.exists())
@@ -233,20 +186,19 @@ class IdleInhibitTests(unittest.TestCase):
         auto = self.state_dir / "idle-inhibit"
         stay.touch()
         auto.touch()
-        self.daemon = Daemon(self.state_dir)
-        self.daemon.wait_for_name("org.freedesktop.ScreenSaver")
+        self.start_daemon()
         wait_for(lambda: not stay.exists(), message="leftover stay-awake not cleared")
         wait_for(lambda: not auto.exists(), message="leftover auto marker not cleared")
 
 
 def main() -> int:
     if os.environ.get("IDLE_INHIBIT_TEST_INNER") != "1":
-        with __import__("tempfile").TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp:
             env = os.environ.copy()
             env["IDLE_INHIBIT_TEST_INNER"] = "1"
             env["OMARCHY_IDLE_INHIBIT_STATE_DIR"] = str(Path(tmp) / "indicators")
             return subprocess.run(
-                ["dbus-run-session", "--", sys.executable, __file__] + sys.argv[1:],
+                ["dbus-run-session", "--", sys.executable, __file__, *sys.argv[1:]],
                 env=env,
             ).returncode
 
