@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "lukaseppler.idle-inhibit",
   "name": "Idle Inhibit",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "Lukas Eppler",
   "license": "MIT",
   "homepage": "https://github.com/lukaseppler/omarchy-idle-inhibit",

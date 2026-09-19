@@ -17,29 +17,47 @@ Item {
     return url
   }
   readonly property string daemonPath: sourceDir ? sourceDir + "/bin/idle-inhibit-daemon" : ""
+  readonly property string python: "/usr/bin/python3"
 
   property var status: ({ held: false, count: 0, holders: [], stayAwake: false, auto: false, screensaverName: false })
   property bool stoodDown: false
+  property bool interpreterOk: false
 
   function applyStatus(raw) {
-    var next = null
     try {
-      next = JSON.parse(String(raw || ""))
-    } catch (error) {
-      return
-    }
-    if (!next || typeof next !== "object") return
-    root.status = next
-    if (next.screensaverName) root.stoodDown = false
+      var next = JSON.parse(String(raw || ""))
+      if (next && typeof next === "object") root.status = next
+    } catch (error) {}
   }
 
   function startDaemon() {
-    if (!root.daemonPath || daemon.running || root.stoodDown) return
-    daemon.command = ["python3", root.daemonPath]
+    if (!root.daemonPath || daemon.running || root.stoodDown || !root.interpreterOk) return
+    daemon.command = [root.python, root.daemonPath]
     daemon.running = true
   }
 
-  onDaemonPathChanged: startDaemon()
+  function checkThenStart() {
+    if (!root.daemonPath || daemon.running || root.stoodDown) return
+    if (root.interpreterOk) {
+      startDaemon()
+      return
+    }
+    if (interpreterCheck.running) return
+    interpreterCheck.command = [root.python, root.daemonPath, "--check-interpreter"]
+    interpreterCheck.running = true
+  }
+
+  Process {
+    id: interpreterCheck
+    onExited: function(exitCode) {
+      if (exitCode === 0) {
+        root.interpreterOk = true
+        startDaemon()
+        return
+      }
+      console.log("idle-inhibit refused untrusted interpreter /usr/bin/python3")
+    }
+  }
 
   Process {
     id: daemon
@@ -52,7 +70,6 @@ Item {
     onExited: function(exitCode) {
       if (exitCode === 0) {
         root.stoodDown = true
-        console.log("idle-inhibit daemon stood down (screensaver name already owned)")
         return
       }
       restartTimer.restart()
@@ -66,8 +83,10 @@ Item {
     onTriggered: root.startDaemon()
   }
 
+  Component.onCompleted: checkThenStart()
   Component.onDestruction: {
     restartTimer.stop()
+    interpreterCheck.running = false
     daemon.running = false
   }
 

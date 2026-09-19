@@ -1,27 +1,12 @@
 #!/usr/bin/env python3
-"""Own org.freedesktop.ScreenSaver and drive Omarchy stay-awake.
-
-Omarchy's idle service honors Wayland inhibitors only. Browsers and players
-call D-Bus Inhibit() instead; nothing has owned that name since hypridle was
-replaced, so the screensaver fires over playing video.
-
-This process:
-- owns org.freedesktop.ScreenSaver (exits 0 if the name is already taken)
-- answers Inhibit/UnInhibit on Chromium's path and the Firefox/VLC path
-- reaps inhibits when the caller leaves the bus
-- touches Omarchy's stay-awake flag only while a cookie is held, and does
-  not clear a stay-awake the user turned on themselves
-
-State directory (override with OMARCHY_IDLE_INHIBIT_STATE_DIR):
-  ~/.local/state/omarchy/indicators/stay-awake    # same file as `omarchy toggle idle`
-  ~/.local/state/omarchy/indicators/idle-inhibit  # we created stay-awake
-"""
+"""Own org.freedesktop.ScreenSaver and drive Omarchy stay-awake while video plays."""
 
 from __future__ import annotations
 
 import json
 import os
 import signal
+import stat
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -36,6 +21,8 @@ SCREENSAVER_NAME = "org.freedesktop.ScreenSaver"
 SCREENSAVER_PATHS = ("/org/freedesktop/ScreenSaver", "/ScreenSaver")
 MAX_INHIBITS = 1024
 MAX_STRING = 256
+TRUSTED_PYTHON = "/usr/bin/python3"
+TRUSTED_PREFIXES = ("/usr/bin/", "/usr/lib/")
 
 SCREENSAVER_XML = """
 <node>
@@ -55,14 +42,49 @@ SCREENSAVER_XML = """
 
 def state_dir() -> Path:
     override = os.environ.get("OMARCHY_IDLE_INHIBIT_STATE_DIR")
-    if override:
-        return Path(override)
-    return Path.home() / ".local/state/omarchy/indicators"
+    return Path(override) if override else Path.home() / ".local/state/omarchy/indicators"
 
 
-def clip(value: str) -> str:
-    text = str(value or "")
-    return text if len(text) <= MAX_STRING else text[: MAX_STRING - 1] + "…"
+def too_long(value: object) -> bool:
+    return not isinstance(value, str) or len(value) > MAX_STRING
+
+
+def trusted_interpreter(path: str) -> str | None:
+    """Absolute, root-owned interpreter resolving under /usr/bin or /usr/lib.
+
+    Symlink permission bits are unused on Linux (typically 777). The resolved
+    regular file must not be group- or world-writable. PATH is never consulted.
+    """
+    if not path or not os.path.isabs(path):
+        return None
+    try:
+        link = os.lstat(path)
+    except OSError:
+        return None
+    if link.st_uid != 0:
+        return None
+    if not stat.S_ISLNK(link.st_mode) and (link.st_mode & 0o022):
+        return None
+    real = os.path.realpath(path)
+    if not real.startswith(TRUSTED_PREFIXES):
+        return None
+    try:
+        body = os.stat(real)
+    except OSError:
+        return None
+    if not stat.S_ISREG(body.st_mode) or body.st_uid != 0 or body.st_mode & 0o022:
+        return None
+    return real
+
+
+def check_interpreter() -> int:
+    resolved = trusted_interpreter(TRUSTED_PYTHON)
+    running = trusted_interpreter(os.path.realpath(sys.executable))
+    if not resolved or not running:
+        return 1
+    sys.stdout.write(resolved + "\n")
+    sys.stdout.flush()
+    return 0
 
 
 @dataclass
@@ -77,9 +99,8 @@ class IdleInhibitDaemon:
         self.loop = GLib.MainLoop()
         self.connection: Gio.DBusConnection | None = None
         self.holds: dict[int, Hold] = {}
-        self.next_cookie = 1
+        self.cookie = 0
         self.acquired = False
-        self.auto_active = False
         self.stopping = False
         self.exit_code = 0
 
@@ -87,10 +108,10 @@ class IdleInhibitDaemon:
     def held(self) -> bool:
         return bool(self.holds)
 
-    def stay_awake_path(self) -> Path:
+    def stay_path(self) -> Path:
         return state_dir() / "stay-awake"
 
-    def auto_path(self) -> Path:
+    def claim_path(self) -> Path:
         return state_dir() / "idle-inhibit"
 
     def status(self) -> dict:
@@ -98,16 +119,11 @@ class IdleInhibitDaemon:
             "held": self.held,
             "count": len(self.holds),
             "holders": [
-                {
-                    "cookie": cookie,
-                    "sender": hold.sender,
-                    "app": hold.app,
-                    "reason": hold.reason,
-                }
+                {"cookie": cookie, "sender": hold.sender, "app": hold.app, "reason": hold.reason}
                 for cookie, hold in sorted(self.holds.items())
             ],
-            "stayAwake": self.stay_awake_path().exists(),
-            "auto": self.auto_path().exists(),
+            "stayAwake": self.stay_path().exists(),
+            "auto": self.claim_path().exists(),
             "screensaverName": self.acquired,
         }
 
@@ -116,70 +132,123 @@ class IdleInhibitDaemon:
         sys.stdout.flush()
 
     def log(self, message: str) -> None:
-        sys.stderr.write(f"idle-inhibit: {message}\n")
+        sys.stderr.write(f"idle-inhibit: {message[:MAX_STRING]}\n")
         sys.stderr.flush()
+
+    def read_claim(self) -> tuple[int, int] | None:
+        try:
+            data = json.loads(self.claim_path().read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return None
+        if not isinstance(data, dict):
+            return None
+        dev, ino = data.get("dev"), data.get("ino")
+        if not isinstance(dev, int) or not isinstance(ino, int):
+            return None
+        return dev, ino
+
+    def write_claim(self, dev: int, ino: int) -> None:
+        path = self.claim_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name("idle-inhibit.tmp")
+        tmp.write_text(json.dumps({"dev": dev, "ino": ino}), encoding="utf-8")
+        tmp.replace(path)
+
+    def stay_matches(self, claim: tuple[int, int]) -> bool:
+        try:
+            info = self.stay_path().stat()
+        except OSError:
+            return False
+        return (info.st_dev, info.st_ino) == claim
+
+    def create_owned_stay(self) -> None:
+        stay = self.stay_path()
+        try:
+            fd = os.open(stay, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            os.close(fd)
+        except FileExistsError:
+            return
+        info = os.stat(stay)
+        self.write_claim(info.st_dev, info.st_ino)
+
+    def drop_owned_stay(self, claim: tuple[int, int]) -> None:
+        if self.stay_matches(claim):
+            self.stay_path().unlink(missing_ok=True)
+        self.claim_path().unlink(missing_ok=True)
+
+    def clear_stale_claim(self) -> None:
+        claim = self.read_claim()
+        if claim and self.stay_matches(claim):
+            self.stay_path().unlink(missing_ok=True)
+        self.claim_path().unlink(missing_ok=True)
+        self.claim_path().with_name("idle-inhibit.tmp").unlink(missing_ok=True)
+
+    def sync_stay_awake(self) -> None:
+        state_dir().mkdir(parents=True, exist_ok=True)
+        stay = self.stay_path()
+        claim = self.read_claim()
+        owned = claim is not None and self.stay_matches(claim)
+
+        if self.held:
+            if owned:
+                return
+            if claim is not None:
+                self.claim_path().unlink(missing_ok=True)
+                if stay.exists():
+                    return
+            elif stay.exists():
+                return
+            self.create_owned_stay()
+            return
+
+        if claim is not None:
+            self.drop_owned_stay(claim)
 
     def allocate_cookie(self) -> int | None:
         if len(self.holds) >= MAX_INHIBITS:
             return None
-        for _ in range(MAX_INHIBITS + 1):
-            cookie = self.next_cookie
-            self.next_cookie = 1 if cookie == 0xFFFFFFFF else cookie + 1
-            if cookie and cookie not in self.holds:
-                return cookie
-        return None
+        self.cookie += 1
+        return self.cookie
 
     def inhibit(self, sender: str, app: str, reason: str) -> int | None:
         cookie = self.allocate_cookie()
         if cookie is None:
             return None
-        self.holds[cookie] = Hold(sender=sender, app=clip(app), reason=clip(reason))
+        self.holds[cookie] = Hold(sender=sender, app=app, reason=reason)
         self.sync_stay_awake()
         self.publish()
-        self.log(f"inhibit cookie={cookie} app={clip(app)!r} reason={clip(reason)!r}")
         return cookie
 
-    def uninhibit(self, cookie: int) -> None:
-        hold = self.holds.pop(cookie, None)
+    def uninhibit(self, cookie: int, sender: str) -> str | None:
+        hold = self.holds.get(cookie)
         if hold is None:
-            return
+            return None
+        if hold.sender != sender:
+            return "org.freedesktop.DBus.Error.AccessDenied"
+        del self.holds[cookie]
         self.sync_stay_awake()
         self.publish()
-        self.log(f"uninhibit cookie={cookie} app={hold.app!r}")
+        return None
 
     def drop_sender(self, sender: str) -> None:
-        cookies = [cookie for cookie, hold in self.holds.items() if hold.sender == sender]
-        if not cookies:
+        kept = {cookie: hold for cookie, hold in self.holds.items() if hold.sender != sender}
+        if len(kept) == len(self.holds):
             return
-        for cookie in cookies:
-            self.holds.pop(cookie, None)
+        self.holds = kept
         self.sync_stay_awake()
         self.publish()
-        self.log(f"reaped {len(cookies)} inhibit(s) from {sender}")
-
-    def sync_stay_awake(self) -> None:
-        state_dir().mkdir(parents=True, exist_ok=True)
-        stay = self.stay_awake_path()
-        auto = self.auto_path()
-
-        if self.held:
-            if stay.exists() and not auto.exists():
-                return
-            auto.touch()
-            stay.touch()
-            self.auto_active = True
-            return
-
-        if auto.exists() or self.auto_active:
-            auto.unlink(missing_ok=True)
-            stay.unlink(missing_ok=True)
-            self.auto_active = False
 
     def on_method(self, connection, sender, object_path, interface_name, method_name, parameters, invocation):
         try:
             if method_name == "Inhibit":
-                app, reason = parameters.unpack()
-                cookie = self.inhibit(sender, app, reason)
+                unpacked = parameters.unpack()
+                if len(unpacked) != 2 or too_long(unpacked[0]) or too_long(unpacked[1]):
+                    invocation.return_dbus_error(
+                        "org.freedesktop.DBus.Error.InvalidArgs",
+                        "application_name and reason_for_inhibit must be at most 256 characters",
+                    )
+                    return
+                cookie = self.inhibit(sender, unpacked[0], unpacked[1])
                 if cookie is None:
                     invocation.return_dbus_error(
                         "org.freedesktop.DBus.Error.LimitsExceeded",
@@ -190,16 +259,18 @@ class IdleInhibitDaemon:
                 return
             if method_name == "UnInhibit":
                 (cookie,) = parameters.unpack()
-                self.uninhibit(int(cookie))
+                denied = self.uninhibit(int(cookie), sender)
+                if denied:
+                    invocation.return_dbus_error(denied, "cookie not owned by sender")
+                    return
                 invocation.return_value(None)
                 return
             invocation.return_dbus_error("org.freedesktop.DBus.Error.UnknownMethod", method_name)
         except Exception as error:  # noqa: BLE001 - must not hang the D-Bus caller
-            self.log(f"method {method_name} failed: {error}")
-            invocation.return_dbus_error("org.freedesktop.DBus.Error.Failed", str(error))
+            invocation.return_dbus_error("org.freedesktop.DBus.Error.Failed", str(error)[:MAX_STRING])
 
     def on_name_owner_changed(self, connection, sender_name, object_path, interface_name, signal_name, parameters):
-        name, _old_owner, new_owner = parameters.unpack()
+        name, _old, new_owner = parameters.unpack()
         if new_owner == "" and str(name).startswith(":"):
             self.drop_sender(name)
 
@@ -219,68 +290,55 @@ class IdleInhibitDaemon:
             Gio.DBusSignalFlags.NONE,
             self.on_name_owner_changed,
         )
-        self.publish()
 
     def on_bus_acquired(self, connection, name) -> None:
         self.register_objects(connection)
 
     def on_name_acquired(self, connection, name) -> None:
         self.acquired = True
-        self.register_objects(connection)
         self.publish()
-        self.log("acquired org.freedesktop.ScreenSaver")
 
     def on_name_lost(self, connection, name) -> None:
         if self.stopping:
             return
-        self.log(
-            "lost org.freedesktop.ScreenSaver; standing down"
-            if self.acquired
-            else "org.freedesktop.ScreenSaver already owned; standing down"
-        )
         self.exit_code = 0
         self.request_stop()
-
-    def shutdown(self) -> None:
-        self.holds.clear()
-        self.sync_stay_awake()
-        self.publish()
 
     def request_stop(self) -> None:
         if self.stopping:
             return
         self.stopping = True
-        self.shutdown()
+        self.holds.clear()
+        self.sync_stay_awake()
+        self.publish()
         if self.loop.is_running():
             self.loop.quit()
-        else:
-            GLib.idle_add(self.loop.quit)
 
     def on_stop(self, *_args) -> bool:
-        self.log("stopping")
         self.request_stop()
         return GLib.SOURCE_REMOVE
 
     def run(self) -> int:
-        leftover = self.auto_path()
-        if leftover.exists():
-            leftover.unlink()
-            self.stay_awake_path().unlink(missing_ok=True)
-            self.log("cleared leftover auto stay-awake")
-
+        if not trusted_interpreter(TRUSTED_PYTHON) or not trusted_interpreter(os.path.realpath(sys.executable)):
+            self.log("refusing untrusted interpreter")
+            return 1
+        self.clear_stale_claim()
         GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, self.on_stop)
         GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGINT, self.on_stop)
         Gio.bus_own_name(
             Gio.BusType.SESSION,
             SCREENSAVER_NAME,
-            Gio.BusNameOwnerFlags.DO_NOT_QUEUE,
+            Gio.BusNameOwnerFlags.ALLOW_REPLACEMENT | Gio.BusNameOwnerFlags.DO_NOT_QUEUE,
             self.on_bus_acquired,
             self.on_name_acquired,
             self.on_name_lost,
         )
-        self.loop.run()
+        if not self.stopping:
+            self.loop.run()
         return self.exit_code
 
 
 if __name__ == "__main__":
+    if "--check-interpreter" in sys.argv:
+        sys.exit(check_interpreter())
     sys.exit(IdleInhibitDaemon().run())

@@ -1,16 +1,11 @@
 # Idle Inhibit for Omarchy
 
-Keeps the Omarchy screensaver and lock off while a browser or player is playing
-video.
+Keeps the screensaver off while a browser or player is playing video.
 
-Omarchy 4 replaced `hypridle` with a Quickshell idle service that only honors
-Wayland inhibitors. Chromium, Firefox/Zen, and VLC call
-`org.freedesktop.ScreenSaver.Inhibit()` instead. Nothing owns that name, so the
-screensaver comes up over the movie.
-
-This plugin owns the name, and turns on Omarchy stay-awake (the coffee cup)
-for as long as a player holds `Inhibit()`. It stands down if Omarchy later
-ships its own owner.
+Omarchy’s idle service only honors Wayland inhibitors. Chromium, Firefox/Zen,
+and VLC call `org.freedesktop.ScreenSaver.Inhibit()` instead. This plugin owns
+that name, turns on stay-awake for as long as a player holds `Inhibit()`, and
+stands down if Omarchy later takes the name.
 
 Upstream: [omacom/omarchy#6475](https://github.com/omacom/omarchy/issues/6475).
 
