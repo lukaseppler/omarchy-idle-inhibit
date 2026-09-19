@@ -4,10 +4,15 @@ Keeps the screensaver off while a browser or player is playing video.
 
 Omarchy’s idle service only honors Wayland inhibitors. Chromium, Firefox/Zen,
 and VLC call `org.freedesktop.ScreenSaver.Inhibit()` instead. This plugin owns
-that name, turns on stay-awake for as long as a player holds `Inhibit()`, and
-stands down if Omarchy later takes the name.
+that name and turns on stay-awake for as long as a player holds `Inhibit()`.
+That is a workaround: it flips the coffee cup rather than teaching the idle
+service about D-Bus inhibits.
 
-Upstream: [omacom/omarchy#6475](https://github.com/omacom/omarchy/issues/6475).
+The in-tree fix is for Omarchy to own `org.freedesktop.ScreenSaver` again and
+gate idle on it, as hypridle did — [omacom/omarchy#6475](https://github.com/omacom/omarchy/issues/6475),
+implemented in [omacom/omarchy#8452](https://github.com/omacom/omarchy/pull/8452).
+Until that lands, this daemon holds the name. It stands down if Omarchy (or
+anything else) takes it.
 
 ## Install
 
