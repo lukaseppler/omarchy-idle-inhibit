@@ -22,22 +22,31 @@ Item {
   property var status: ({ held: false, count: 0, holders: [], stayAwake: false, auto: false, screensaverName: false })
   property bool stoodDown: false
   property bool interpreterOk: false
+  property bool disposed: false
+  property int retryCount: 0
+  property int lastExitCode: -1
+  property real daemonStart: 0
 
   function applyStatus(raw) {
     try {
       var next = JSON.parse(String(raw || ""))
-      if (next && typeof next === "object") root.status = next
+      if (next && typeof next === "object") {
+        if (next.type !== "heartbeat") root.status = next
+      }
     } catch (error) {}
   }
 
   function startDaemon() {
-    if (!root.daemonPath || daemon.running || root.stoodDown || !root.interpreterOk) return
-    daemon.command = [root.python, root.daemonPath]
+    if (root.disposed || !root.daemonPath || daemon.running || root.stoodDown || !root.interpreterOk) return
+    root.daemonStart = Date.now()
+    // argv[1] handshake: the shell pid, so the daemon never mistakes a
+    // reparent target for its owner.
+    daemon.command = [root.python, root.daemonPath, String(Quickshell.processId)]
     daemon.running = true
   }
 
   function checkThenStart() {
-    if (!root.daemonPath || daemon.running || root.stoodDown) return
+    if (root.disposed || !root.daemonPath || daemon.running || root.stoodDown) return
     if (root.interpreterOk) {
       startDaemon()
       return
@@ -68,10 +77,38 @@ Item {
       onRead: function(line) { console.log("idle-inhibit " + line) }
     }
     onExited: function(exitCode) {
-      if (exitCode === 0) {
+      if (root.disposed) return
+      root.lastExitCode = exitCode
+      // A run that lasted a while is genuine progress; a flapping spawn is not.
+      if ((Date.now() - root.daemonStart) / 1000 >= 20) root.retryCount = 0
+      restartTimer.interval = 1000
+
+      if (exitCode === 4) {
+        // The daemon only uses this code when a genuinely foreign owner
+        // (not another copy of this plugin, e.g. a future Omarchy-native
+        // implementation) holds org.freedesktop.ScreenSaver: stand down.
         root.stoodDown = true
+        console.log("idle-inhibit stood down: the name is held by a foreign owner")
         return
       }
+
+      if (exitCode === 0) {
+        // The name is held by a sibling copy of this daemon. Keep trying at a
+        // gentle pace: if the sibling is an orphan or a dying shell's copy it
+        // quits within seconds (watchdog / closed-stdout detection), and we
+        // take over. While a healthy sibling serves, this is redundant but
+        // harmless.
+        root.retryCount += 1
+        if (root.retryCount > 20) restartTimer.interval = 30000
+        else if (root.retryCount > 5) restartTimer.interval = 5000
+        restartTimer.restart()
+        return
+      }
+
+      // Crash or unexpected exit: retry, but do not tight-loop on a
+      // repeatedly failing spawn.
+      root.retryCount += 1
+      if (root.retryCount > 5) restartTimer.interval = 60000
       restartTimer.restart()
     }
   }
@@ -85,6 +122,7 @@ Item {
 
   Component.onCompleted: checkThenStart()
   Component.onDestruction: {
+    root.disposed = true
     restartTimer.stop()
     interpreterCheck.running = false
     daemon.running = false
@@ -102,7 +140,9 @@ Item {
         auto: !!root.status.auto,
         screensaverName: !!root.status.screensaverName,
         stoodDown: root.stoodDown,
-        daemonRunning: daemon.running
+        daemonRunning: daemon.running,
+        retryCount: root.retryCount,
+        lastExitCode: root.lastExitCode
       })
     }
   }

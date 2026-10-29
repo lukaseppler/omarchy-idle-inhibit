@@ -15,6 +15,7 @@ import unittest
 from pathlib import Path
 
 DAEMON = Path(__file__).resolve().parents[1] / "bin" / "idle-inhibit-daemon"
+EXIT_FOREIGN = 4  # bin/idle-inhibit-daemon: "held by a foreign owner"
 
 Gio = None
 GLib = None
@@ -106,7 +107,7 @@ def wait_for(predicate, timeout: float = 3.0, message: str = "condition"):
 def write_claim(state_dir: Path, stay: Path) -> None:
     info = stay.stat()
     (state_dir / "idle-inhibit").write_text(
-        json.dumps({"dev": info.st_dev, "ino": info.st_ino}),
+        json.dumps({"dev": info.st_dev, "ino": info.st_ino, "pid": os.getpid()}),
         encoding="utf-8",
     )
 
@@ -317,7 +318,7 @@ class IdleInhibitTests(unittest.TestCase):
             code = self.daemon.proc.wait(timeout=4)
         except subprocess.TimeoutExpired:
             self.fail("daemon did not stand down after name replacement")
-        self.assertEqual(code, 0)
+        self.assertEqual(code, EXIT_FOREIGN)
         wait_for(lambda: not self.stay.exists(), message="stay-awake lingered after replacement")
         if thief.poll() is None:
             thief.send_signal(signal.SIGTERM)
@@ -334,6 +335,160 @@ class IdleInhibitTests(unittest.TestCase):
         wait_for(self.stay.exists, message="256-character reason should be accepted")
         holder.uninhibit(cookie)
         wait_for(lambda: not self.stay.exists(), message="accepted inhibit did not release")
+
+
+class OverlapWithHoldTests(unittest.TestCase):
+    """A losing sibling spawn must not wipe the serving daemon's state."""
+
+    def setUp(self):
+        _load_gi()
+        self.state_dir = Path(os.environ["OMARCHY_IDLE_INHIBIT_STATE_DIR"])
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        self.stay = self.state_dir / "stay-awake"
+        self.auto = self.state_dir / "idle-inhibit"
+        self.stay.unlink(missing_ok=True)
+        self.auto.unlink(missing_ok=True)
+        self.daemon = Daemon(self.state_dir)
+        self.addCleanup(self.daemon.stop)
+        self.daemon.wait_for_name()
+
+    def test_sibling_spawn_leaves_serving_state_alone(self):
+        holder = SessionClient()
+        self.addCleanup(holder.close)
+        cookie = holder.inhibit()
+        wait_for(self.stay.exists, message="stay-awake missing after Inhibit")
+        wait_for(self.auto.exists, message="claim missing after Inhibit")
+
+        sibling = Daemon(self.state_dir)
+        self.addCleanup(sibling.stop)
+        code = sibling.proc.wait(timeout=5)
+        self.assertEqual(code, 0)
+
+        # Two seconds past the losing spawn, the serving state must still be there.
+        time.sleep(2)
+        self.assertTrue(self.stay.exists(), "stay-awake was wiped by a losing sibling spawn")
+        self.assertTrue(self.auto.exists(), "claim was wiped by a losing sibling spawn")
+
+        holder.uninhibit(cookie)
+        wait_for(lambda: not self.stay.exists(), message="stay-awake lingered after UnInhibit")
+        wait_for(lambda: not self.auto.exists(), message="claim lingered after UnInhibit")
+
+
+class WatchdogTests(unittest.TestCase):
+    """The daemon exits shortly after the shell-like watch pid dies."""
+
+    def test_exits_when_watch_pid_dies(self):
+        # argv[1] handshake in case (--check-interpreter): watch a throwaway
+        # process that dies.
+        state = Path(os.environ["OMARCHY_IDLE_INHIBIT_STATE_DIR"])
+        state.mkdir(parents=True, exist_ok=True)
+        keeper = subprocess.Popen(
+            ["bash", "-c", "sleep 30"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.addCleanup(keeper.kill)
+        daemon_proc = subprocess.Popen(
+            [sys.executable, str(DAEMON), str(keeper.pid)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            env={**os.environ, "OMARCHY_IDLE_INHIBIT_STATE_DIR": str(state)})
+        self.addCleanup(daemon_proc.kill)
+        wait_for(lambda: keeper.pid and daemon_proc.poll() is None, message="daemon did not start", timeout=4)
+        keeper.kill()
+        deadline = time.time() + 8
+        while time.time() < deadline:
+            if daemon_proc.poll() is not None:
+                break
+            time.sleep(0.2)
+        else:
+            self.fail("daemon survived the death of the watched pid")
+        self.assertEqual(daemon_proc.returncode, 0)
+
+    def test_exits_when_parent_dies(self):
+        # No argv handshake: the getppid fallback covers a parent dying after
+        # the daemon captured it.
+        state = Path(os.environ["OMARCHY_IDLE_INHIBIT_STATE_DIR"])
+        state.mkdir(parents=True, exist_ok=True)
+        marker = state / "watchdog.pid"
+        python = sys.executable
+        parent = subprocess.Popen(
+            ["bash", "-c",
+             f'{python} "{DAEMON}" & echo $! > "{marker}"; sleep 30'],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            env=os.environ.copy())
+        self.addCleanup(parent.kill)
+        wait_for(lambda: marker.exists(), message="daemon pid marker never appeared", timeout=5)
+        pid = int(marker.read_text().strip())
+        time.sleep(0.5)  # let the daemon capture its parent pid first
+
+        def _is_gone() -> bool:
+            try:
+                fields = Path(f"/proc/{pid}/stat").read_text().split()
+                return fields[2] == "Z"  # state char: zombie == exited
+            except OSError:
+                return True
+
+        parent.kill()
+        wait_for(_is_gone, message="daemon survived the death of its parent", timeout=8)
+
+
+class EpipeTests(unittest.TestCase):
+    """A daemon whose stdout reader is gone must leave the bus promptly."""
+
+    def test_stand_down_when_reader_gone(self):
+        state = Path(os.environ["OMARCHY_IDLE_INHIBIT_STATE_DIR"])
+        state.mkdir(parents=True, exist_ok=True)
+        (state / "stay-awake").unlink(missing_ok=True)
+        (state / "idle-inhibit").unlink(missing_ok=True)
+        proc = subprocess.Popen(
+            [sys.executable, str(DAEMON)],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            env={**os.environ, "OMARCHY_IDLE_INHIBIT_STATE_DIR": str(state)})
+        self.addCleanup(proc.stdout.close)
+        self.addCleanup(lambda: proc.kill() if proc.poll() is None else None)
+        try:
+            proc.stdout.readline()  # initial status: the daemon is up and on the bus
+        except ValueError:
+            pass
+        proc.stdout.close()  # break the daemon's writer before triggering one more publish
+        conn = SessionClient()
+        self.addCleanup(conn.close)
+        cookie = conn.inhibit()  # triggers a publish into the dead pipe
+        code = proc.wait(timeout=5)
+        self.assertEqual(code, 0)
+        wait_for(lambda: not (state / "stay-awake").exists(), message="stay-awake lingered", timeout=2)
+        try:
+            conn.uninhibit(cookie)  # best effort: nothing left to answer
+        except GLib.GError:
+            pass  # ServiceUnknown proves the name was released
+
+
+class HeartbeatTests(unittest.TestCase):
+    """State clobbered under an active hold is restored within a heartbeat."""
+
+    def test_self_heals_clobbered_state(self):
+        _load_gi()
+        state = Path(os.environ["OMARCHY_IDLE_INHIBIT_STATE_DIR"])
+        state.mkdir(parents=True, exist_ok=True)
+        stay = state / "stay-awake"
+        auto = state / "idle-inhibit"
+        stay.unlink(missing_ok=True)
+        auto.unlink(missing_ok=True)
+        daemon = Daemon(state)
+        self.addCleanup(daemon.stop)
+        daemon.wait_for_name()
+
+        holder = SessionClient()
+        self.addCleanup(holder.close)
+        cookie = holder.inhibit()
+        wait_for(stay.exists, message="stay-awake missing after Inhibit")
+
+        stay.unlink(missing_ok=True)
+        auto.unlink(missing_ok=True)
+        wait_for(stay.exists, message="heartbeat did not recreate stay-awake", timeout=40)
+        wait_for(auto.exists, message="heartbeat did not recreate the claim", timeout=2)
+
+        holder.uninhibit(cookie)
+        wait_for(lambda: not stay.exists(), message="stay-awake lingered after UnInhibit", timeout=40)
+        wait_for(lambda: not auto.exists(), message="claim lingered after UnInhibit", timeout=5)
 
 
 def main() -> int:

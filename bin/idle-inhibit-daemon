@@ -1,10 +1,23 @@
 #!/usr/bin/env python3
-"""Own org.freedesktop.ScreenSaver and drive Omarchy stay-awake while video plays."""
+"""Own org.freedesktop.ScreenSaver and drive Omarchy stay-awake while video plays.
+
+Ownership semantics (see also Service.qml):
+- exit 0: the name is held by a sibling copy of this daemon (QML keeps
+  retrying gently; a dying sibling loses the name within seconds)
+- exit 4 (EXIT_FOREIGN): the name is held by a genuinely foreign owner,
+  e.g. a future native Omarchy implementation; QML stands down for this
+  shell's lifetime
+This process also refuses to outlive its environment: a 3s parent-liveness
+watchdog exits on shell death, and a 30s heartbeat re-syncs state and
+exits when the stdout reader is gone. Claim/stay-awake state files are
+only cleared after actually owning the name (on_name_acquired).
+"""
 
 from __future__ import annotations
 
 import json
 import os
+import random
 import signal
 import stat
 import sys
@@ -21,6 +34,9 @@ SCREENSAVER_NAME = "org.freedesktop.ScreenSaver"
 SCREENSAVER_PATHS = ("/org/freedesktop/ScreenSaver", "/ScreenSaver")
 MAX_INHIBITS = 1024
 MAX_STRING = 256
+# Distinct exit code for "the name is held by a foreign owner". QML treats
+# this as the only permanent stand-down; exit 0 (sibling) keeps retrying.
+EXIT_FOREIGN = 4
 TRUSTED_PYTHON = "/usr/bin/python3"
 TRUSTED_PREFIXES = ("/usr/bin/", "/usr/lib/")
 
@@ -99,10 +115,12 @@ class IdleInhibitDaemon:
         self.loop = GLib.MainLoop()
         self.connection: Gio.DBusConnection | None = None
         self.holds: dict[int, Hold] = {}
-        self.cookie = 0
+        self.cookie = random.randrange(1, 2**32)
         self.acquired = False
         self.stopping = False
         self.exit_code = 0
+        self.streams_detached = False
+        self.watch_pid = self._init_watch_pid()
 
     @property
     def held(self) -> bool:
@@ -127,39 +145,77 @@ class IdleInhibitDaemon:
             "screensaverName": self.acquired,
         }
 
+    def _detach_streams(self) -> None:
+        """send stdout/stderr to devnull after a broken pipe so the interpreter
+        shutdown flush cannot turn a graceful exit (0) into exit 120."""
+        if self.streams_detached:
+            return
+        try:
+            devnull = open(os.devnull, "w", encoding="utf-8")  # noqa: SIM115 - process-lifetime handle
+        except OSError:
+            return
+        self.streams_detached = True
+        sys.stdout = devnull
+        sys.stderr = devnull
+
     def publish(self) -> None:
-        sys.stdout.write(json.dumps(self.status(), separators=(",", ":")) + "\n")
-        sys.stdout.flush()
+        text = json.dumps(self.status(), separators=(",", ":")) + "\n"
+        try:
+            sys.stdout.write(text)
+            sys.stdout.flush()
+        except OSError:
+            # Our reader (the shell plugin instance) is gone; a newer copy
+            # should take over. Stand down instead of keeping the name.
+            self.log("stdout closed; standing down")
+            self._detach_streams()
+            self.request_stop()
+
+    def publish_heartbeat(self) -> None:
+        try:
+            sys.stdout.write('{"type":"heartbeat"}\n')
+            sys.stdout.flush()
+        except OSError:
+            self.log("stdout closed; standing down")
+            self._detach_streams()
+            self.request_stop()
 
     def log(self, message: str) -> None:
-        sys.stderr.write(f"idle-inhibit: {message[:MAX_STRING]}\n")
-        sys.stderr.flush()
+        try:
+            sys.stderr.write(f"idle-inhibit: {message[:MAX_STRING]}\n")
+            sys.stderr.flush()
+        except OSError:
+            self._detach_streams()
 
-    def read_claim(self) -> tuple[int, int] | None:
+    def read_claim(self) -> tuple[int, int, int] | None:
         try:
             data = json.loads(self.claim_path().read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             return None
         if not isinstance(data, dict):
             return None
-        dev, ino = data.get("dev"), data.get("ino")
-        if not isinstance(dev, int) or not isinstance(ino, int):
+        dev, ino, pid = data.get("dev"), data.get("ino"), data.get("pid")
+        if not (isinstance(dev, int) and isinstance(ino, int) and isinstance(pid, int)):
             return None
-        return dev, ino
+        return dev, ino, pid
 
     def write_claim(self, dev: int, ino: int) -> None:
         path = self.claim_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name("idle-inhibit.tmp")
-        tmp.write_text(json.dumps({"dev": dev, "ino": ino}), encoding="utf-8")
+        tmp.write_text(json.dumps({"dev": dev, "ino": ino, "pid": os.getpid()}), encoding="utf-8")
         tmp.replace(path)
 
-    def stay_matches(self, claim: tuple[int, int]) -> bool:
+    def stay_matches(self, claim: tuple[int, int, int]) -> bool:
         try:
             info = self.stay_path().stat()
         except OSError:
             return False
-        return (info.st_dev, info.st_ino) == claim
+        return (info.st_dev, info.st_ino) == claim[:2]
+
+    def claim_is_ours(self, claim: tuple[int, int, int] | None) -> bool:
+        """Only the daemon that wrote a claim may delete it: claims are shared
+        files, and a losing sibling must never wipe a serving copy's state."""
+        return claim is not None and claim[2] == os.getpid()
 
     def create_owned_stay(self) -> None:
         stay = self.stay_path()
@@ -187,12 +243,24 @@ class IdleInhibitDaemon:
         state_dir().mkdir(parents=True, exist_ok=True)
         stay = self.stay_path()
         claim = self.read_claim()
-        owned = claim is not None and self.stay_matches(claim)
+        owned = claim is not None and claim[2] == os.getpid() and self.stay_matches(claim)
 
         if self.held:
             if owned:
                 return
-            if claim is not None:
+            if claim is not None and self.claim_is_ours(claim):
+                # Our claim, but the stay file changed underneath it (the user
+                # recreated it): the claim is stale, the file is the user's.
+                self.claim_path().unlink(missing_ok=True)
+                if stay.exists():
+                    return
+            if claim is not None and claim[2] != os.getpid():
+                # Foreign claim: we own the bus now, so adopt the state. If
+                # their claim still matches the stay inode it was created by
+                # the dead copy we replaced (always safe to remove); a bare
+                # user stay file is left untouched.
+                if self.stay_matches(claim):
+                    self.stay_path().unlink(missing_ok=True)
                 self.claim_path().unlink(missing_ok=True)
                 if stay.exists():
                     return
@@ -201,7 +269,7 @@ class IdleInhibitDaemon:
             self.create_owned_stay()
             return
 
-        if claim is not None:
+        if self.claim_is_ours(claim):
             self.drop_owned_stay(claim)
 
     def allocate_cookie(self) -> int | None:
@@ -296,12 +364,58 @@ class IdleInhibitDaemon:
 
     def on_name_acquired(self, connection, name) -> None:
         self.acquired = True
+        # Clear only once we actually own the name: a copy that loses the
+        # startup race must not destroy the stay-awake state the serving
+        # daemon is relying on.
+        self.clear_stale_claim()
         self.publish()
+
+    def _owner_is_sibling(self, connection, name: str) -> bool:
+        """True when the bus name is held by another copy of this daemon.
+
+        Decides between "sibling copy serving fine" (exit 0, the QML layer
+        keeps retrying gently) and "genuinely foreign owner, e.g. a future
+        native Omarchy implementation" (exit EXIT_FOREIGN, QML stands down
+        for the lifetime of the shell). Unclassifiable resolves to foreign,
+        which is the conservative upstream behavior.
+        """
+        marker = os.path.basename(sys.argv[0]) if sys.argv else ""
+        try:
+            owner = connection.call_sync(
+                "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
+                "GetNameOwner", GLib.Variant("(s)", (name,)),
+                GLib.VariantType("(s)"), Gio.DBusCallFlags.NONE, -1)
+            bus_id = owner.unpack()[0]
+            reply = connection.call_sync(
+                "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
+                "GetConnectionUnixProcessID", GLib.Variant("(s)", (bus_id,)),
+                GLib.VariantType("(u)"), Gio.DBusCallFlags.NONE, -1)
+            pid = reply.unpack()[0]
+            raw = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode("utf-8", "replace")
+        except (GLib.GError, OSError, ValueError) as error:
+            self.log(f"owner check failed: {error}")
+            return False
+        if not marker:
+            return False
+        return marker in raw
 
     def on_name_lost(self, connection, name) -> None:
         if self.stopping:
             return
-        self.exit_code = 0
+        if connection is None:
+            # The session bus connection itself closed (logout, bus restart):
+            # everything is gone, but the shell may still be alive. Exit
+            # retryably so a healthy shell takes the name back.
+            self.log("session bus connection closed; standing down")
+            self.exit_code = 0
+            self.request_stop()
+            return
+        if self._owner_is_sibling(connection, str(name)):
+            self.log("org.freedesktop.ScreenSaver is served by a sibling; standing down")
+            self.exit_code = 0
+        else:
+            self.log("org.freedesktop.ScreenSaver held by a foreign owner; standing down")
+            self.exit_code = EXIT_FOREIGN
         self.request_stop()
 
     def request_stop(self) -> None:
@@ -318,11 +432,62 @@ class IdleInhibitDaemon:
         self.request_stop()
         return GLib.SOURCE_REMOVE
 
+    @staticmethod
+    def _shell_alive(pid: int) -> bool:
+        try:
+            fields = Path(f"/proc/{pid}/stat").read_text().split()
+            return fields[2] != "Z"  # zombie is dead for our purposes
+        except (OSError, IndexError):
+            return False
+
+    def _init_watch_pid(self) -> int:
+        """The shell pid. The launching shell passes its own pid as argv[1]
+        (a handshake that dodges the fork race: a parent dying before the
+        child reads getppid() would otherwise leave the child watching its
+        own reparent-target for the rest of its life)."""
+        if len(sys.argv) > 1:
+            try:
+                pid = int(sys.argv[1])
+            except ValueError:
+                return os.getppid()
+            if pid > 0:
+                return pid
+        return os.getppid()
+
+    def _check_parent(self) -> bool:
+        """Exit soon after the shell that started us is gone; Quickshell does
+        not reliably kill this child, and an orphaned daemon keeps owning
+        org.freedesktop.ScreenSaver, which makes every future shell instance
+        stand down."""
+        if self.stopping:
+            return GLib.SOURCE_REMOVE
+        if self._shell_alive(self.watch_pid):
+            return GLib.SOURCE_CONTINUE
+        self.log(f"watch pid {self.watch_pid} is gone (shell died); standing down")
+        self.request_stop()
+        return GLib.SOURCE_REMOVE
+
+    def _heartbeat(self) -> bool:
+        """Defense in-depth for stale daemons.
+
+        Periodically re-syncs state (so a clobbered stay-awake under an
+        active hold is recreated within a minute) and emits a minimal line:
+        as soon as the reader (the shell plugin instance) is gone, the write
+        fails and this copy stands down instead of squatting on the name.
+        """
+        try:
+            self.sync_stay_awake()
+        except Exception as error:  # noqa: BLE001 - a timer must not kill the loop
+            self.log(f"heartbeat sync failed: {error}")
+        self.publish_heartbeat()
+        return GLib.SOURCE_CONTINUE if not self.stopping else GLib.SOURCE_REMOVE
+
     def run(self) -> int:
         if not trusted_interpreter(TRUSTED_PYTHON) or not trusted_interpreter(os.path.realpath(sys.executable)):
             self.log("refusing untrusted interpreter")
             return 1
-        self.clear_stale_claim()
+        GLib.timeout_add_seconds(3, self._check_parent)
+        GLib.timeout_add_seconds(30, self._heartbeat)
         GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, self.on_stop)
         GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGINT, self.on_stop)
         Gio.bus_own_name(
